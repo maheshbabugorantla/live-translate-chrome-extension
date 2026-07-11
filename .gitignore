@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+__pycache__/
+*.pyc
+
+# Secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
+# Virtual environments (regenerable, huge)
+.venv/
+venv/
+market-sizing-sdk/

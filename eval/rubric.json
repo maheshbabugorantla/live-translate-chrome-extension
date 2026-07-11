@@ -1,0 +1,56 @@
+{
+  "_comment": "Measurable rubric for FDE Assignment 1. `auto` items are scored by eval.py; `manual` items are scored by a human/grader using the captured evidence + the video demo. Total = 100.",
+  "assignment": "Assignment 1 — Live Translate",
+  "total_points": 100,
+  "criteria": [
+    {
+      "id": "widget_lights_up",
+      "label": "Widget lights up (contract works end to end)",
+      "points": 15,
+      "type": "auto",
+      "check": "translate + batch return valid shapes through the gateway"
+    },
+    {
+      "id": "caching_correctness",
+      "label": "Caching correctness (two-tier, provable, persistent)",
+      "points": 20,
+      "type": "auto",
+      "check": "2nd identical request cached=true with lower latency; SQLite db exists with rows"
+    },
+    {
+      "id": "performance_sla",
+      "label": "Performance & SLA gate",
+      "points": 15,
+      "type": "auto",
+      "check": "benchmark/bench.py exits 0 (all SLAs met)"
+    },
+    {
+      "id": "logging_observability",
+      "label": "Logging & observability",
+      "points": 10,
+      "type": "auto",
+      "check": "/stats returns a hit rate; /health reports the AI service; ai-service.log has structured lines; a request id (X-Request-Id) correlates one request across the gateway and AI-service logs"
+    },
+    {
+      "id": "service_separation_contract",
+      "label": "Service separation & correct status codes",
+      "points": 10,
+      "type": "auto",
+      "check": "400 on bad input; gateway health nests AI-service health"
+    },
+    {
+      "id": "llm_prompt_quality",
+      "label": "LLM & prompt quality (natural Mexican Spanish)",
+      "points": 20,
+      "type": "manual",
+      "check": "grader judges the captured sample translations + video: es-MX register, translation only, numbers/prices/codes preserved"
+    },
+    {
+      "id": "deploy_docs",
+      "label": "Deploy & docs",
+      "points": 10,
+      "type": "manual",
+      "check": "both services deployed on Fly.io with the public gateway /health reachable (pass --deploy-url to capture it); one-command local run; clear README run notes; clean git hygiene (auto-flagged below)"
+    }
+  ]
+}

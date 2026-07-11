@@ -1,0 +1,25 @@
+{
+  "_comment": "SLA targets your backend must meet, plus the cost model the benchmark uses. Edit freely — the PRICES ARE PLACEHOLDERS: set them to your provider's current published rates before trusting the cost numbers.",
+  "target": "http://localhost:8787",
+
+  "sla": {
+    "cache_hit_p95_ms": 60,
+    "cache_miss_p95_ms": 3500,
+    "min_cache_hit_rate_pct": 60,
+    "max_error_rate_pct": 1.0,
+    "min_throughput_rps": 20
+  },
+
+  "cost_model": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_usd_per_mtok": 3.0,
+    "output_usd_per_mtok": 15.0,
+    "monthly_translation_volume": 500000
+  },
+
+  "workload": {
+    "rounds": 4,
+    "concurrency": 8
+  }
+}
