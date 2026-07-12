@@ -14,6 +14,7 @@ TODOs so the widget lights up. Run:
     cp .env.example .env          # then add your API key
     uvicorn app:app --reload --port 8000
 """
+import asyncio
 import os
 import time
 
@@ -91,12 +92,101 @@ async def translate(body: TranslateIn, request: Request):
     return result
 
 
+# --- single-flight coalescing for batch cache misses ------------------------
+# Keyed by (target, text): concurrent requests translating the exact same
+# string share one in-flight Future instead of each firing their own LLM call.
+# This also closes a contract gap — "identical (text, target) must never hit
+# the LLM twice" — that broke once /translate/batch went concurrent.
+_inflight: dict[tuple[str, str], "asyncio.Future[tuple[dict, bool]]"] = {}
+
+
+async def _translate_miss(text: str, target: str, semaphore: asyncio.Semaphore, request: Request) -> tuple[dict, bool]:
+    """Translate a confirmed cache miss: retry once, then fall back to the
+    original text. Returns (result, should_cache) — should_cache is False for
+    the fallback path so callers never persist untranslated text."""
+    async with semaphore:
+        t0 = time.perf_counter()
+        try:
+            translated = await translate_text(text, target, model=MODEL)
+            should_cache = True
+        except Exception as e:
+            log.warning(
+                "translate_item_failed",
+                extra={"requestId": request.headers.get("x-request-id"), "error": str(e)},
+            )
+            try:
+                translated = await translate_text(text, target, model=MODEL)
+                should_cache = True
+            except Exception as e2:
+                log.warning(
+                    "translate_item_retry_failed",
+                    extra={"requestId": request.headers.get("x-request-id"), "error": str(e2)},
+                )
+                translated, should_cache = text, False
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return {"translated": translated, "cached": False, "latencyMs": latency_ms, "model": MODEL}, should_cache
+
+
+async def _translate_coalesced(text: str, target: str, semaphore: asyncio.Semaphore, request: Request) -> tuple[dict, bool]:
+    key = (target, text)
+    existing = _inflight.get(key)
+    if existing is not None:
+        return await existing
+
+    future: "asyncio.Future[tuple[dict, bool]]" = asyncio.get_event_loop().create_future()
+    _inflight[key] = future
+    try:
+        result_pair = await _translate_miss(text, target, semaphore, request)
+    except Exception as exc:
+        future.set_exception(exc)
+        raise
+    else:
+        future.set_result(result_pair)
+        return result_pair
+    finally:
+        _inflight.pop(key, None)
+
+
 @app.post("/translate/batch")
 async def translate_batch(body: BatchIn, request: Request):
     t0 = time.perf_counter()
+    semaphore = asyncio.Semaphore(8)
+
+    stripped = [(t or "").strip() for t in body.texts]
+    non_empty = [t for t in stripped if t]
+
+    # one batched cache lookup instead of one connect+SELECT per item
+    cache_hits = await cache.get_many([(t, body.target) for t in non_empty]) if non_empty else {}
+
+    misses = [t for t in non_empty if t not in cache_hits]
+    # gather() calls _translate_coalesced once per occurrence, but duplicate
+    # misses (same string twice in this batch, or a concurrent request
+    # translating it right now) resolve via the shared future — one LLM call
+    # per unique string, not per occurrence.
+    miss_results = await asyncio.gather(
+        *(_translate_coalesced(t, body.target, semaphore, request) for t in misses)
+    ) if misses else []
+
+    miss_lookup: dict[str, dict] = {}
+    to_persist = []
+    for t, (result, should_cache) in zip(misses, miss_results):
+        miss_lookup[t] = result
+        if should_cache:
+            to_persist.append((t, body.target, result["translated"], result["model"]))
+
+    # one batched write instead of one connect+UPSERT per item; fallbacks
+    # (should_cache=False) are excluded so they can never poison the cache
+    await cache.set_many(to_persist)
+
     results = []
-    for t in body.texts:
-        results.append(await translate_one(t, body.target))
+    for t in stripped:
+        if not t:
+            results.append({"translated": "", "cached": False})
+        elif t in cache_hits:
+            results.append({"translated": cache_hits[t], "cached": True})
+        else:
+            results.append({"translated": miss_lookup[t]["translated"], "cached": False})
+
     latency = int((time.perf_counter() - t0) * 1000)
     hits = sum(1 for r in results if r["cached"])
     log.info(
@@ -104,7 +194,7 @@ async def translate_batch(body: BatchIn, request: Request):
         extra={"requestId": request.headers.get("x-request-id"), "count": len(results), "hits": hits, "latencyMs": latency},
     )
     # widget expects {results: [{translated, cached}], latencyMs}
-    return {"results": [{"translated": r["translated"], "cached": r["cached"]} for r in results], "latencyMs": latency}
+    return {"results": results, "latencyMs": latency}
 
 
 @app.get("/health")
