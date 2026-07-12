@@ -40,6 +40,14 @@
   let busy = false;
   const originalText = new Map(); // textNode -> original string (for Restore)
 
+  // Draggable FAB state. fabPos is null until the user first drags it — the
+  // FAB uses its default CSS right/bottom placement until then, so nothing
+  // changes for anyone who never drags it.
+  const FAB_POS_KEY = "fde-fab-pos";
+  let fabPos = null; // {x, y} in viewport px (left/top), once dragged
+  let dragState = null;
+  let suppressNextClick = false;
+
   // ---- icons (Tabler glyphs — no emoji, no hand-drawn paths) --------------
   const ICON_LANG =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h7"/><path d="M9 3v2c0 4.418 -2.239 8 -5 8"/><path d="M5 9c0 2.144 2.952 3.908 6.7 4"/><path d="M12 20l4 -9l4 9"/><path d="M19.1 18h-6.2"/></svg>';
@@ -52,14 +60,17 @@
   const css = `
   .fde-root, .fde-root *{box-sizing:border-box}
   .fde-fab{position:fixed;right:22px;bottom:22px;width:54px;height:54px;border-radius:999px;
-    display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2147483647;
+    display:flex;align-items:center;justify-content:center;cursor:grab;z-index:2147483647;
     color:#fff;background:#0b0b0c;border:1px solid rgba(255,255,255,.12);
     box-shadow:0 10px 30px rgba(11,11,12,.28), inset 0 1px 0 rgba(255,255,255,.14);
-    transition:transform .16s cubic-bezier(.16,1,.3,1), box-shadow .16s ease}
-  .fde-fab svg{width:24px;height:24px}
+    transition:transform .16s cubic-bezier(.16,1,.3,1), box-shadow .16s ease, opacity .16s ease;
+    touch-action:none}
+  .fde-fab svg{width:24px;height:24px;pointer-events:none}
   .fde-fab:hover{transform:translateY(-1px) scale(1.05);box-shadow:0 16px 40px rgba(11,11,12,.34), inset 0 1px 0 rgba(255,255,255,.16)}
   .fde-fab:active{transform:scale(.96)}
   .fde-fab:focus-visible{outline:2px solid #10b981;outline-offset:3px}
+  .fde-fab.fde-dragging{cursor:grabbing;transition:none}
+  .fde-fab.fde-hidden{opacity:0;pointer-events:none}
 
   .fde-panel{position:fixed;right:22px;bottom:88px;width:320px;max-width:calc(100vw - 44px);
     z-index:2147483647;overflow:hidden;border-radius:16px;
@@ -166,15 +177,30 @@
   const pageBtn = panel.querySelector("#fde-page");
 
   // ---- events -------------------------------------------------------------
-  fab.addEventListener("click", togglePanel);
+  fab.addEventListener("click", (e) => {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
+    togglePanel();
+  });
+  fab.addEventListener("pointerdown", onFabPointerDown);
+  fab.addEventListener("pointermove", onFabPointerMove);
+  fab.addEventListener("pointerup", onFabPointerUp);
+  fab.addEventListener("pointercancel", onFabPointerUp);
   panel.querySelector(".fde-x").addEventListener("click", () => setPanel(false));
   pageBtn.addEventListener("click", translatePage);
   panel.querySelector("#fde-restore").addEventListener("click", restorePage);
+  window.addEventListener("resize", onWindowResize);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", onFullscreenChange);
 
   // Extension popup drives the widget through window events (see extension/content.js)
   window.addEventListener("FDE_TRANSLATE_PAGE", translatePage);
   window.addEventListener("FDE_RESTORE_PAGE", restorePage);
   window.addEventListener("FDE_OPEN", () => setPanel(true));
+
+  restoreFabPosition();
 
   // ---- actions ------------------------------------------------------------
   function togglePanel() {
@@ -183,6 +209,125 @@
   function setPanel(open) {
     panelOpen = open;
     panel.classList.toggle("open", open);
+    if (open && fabPos) positionPanel();
+  }
+
+  // ---- drag + fullscreen-aware FAB -----------------------------------------
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function clampFabPosition() {
+    if (!fabPos) return;
+    const w = fab.offsetWidth || 54;
+    const h = fab.offsetHeight || 54;
+    const maxX = Math.max(4, window.innerWidth - w - 4);
+    const maxY = Math.max(4, window.innerHeight - h - 4);
+    fabPos = { x: clamp(fabPos.x, 4, maxX), y: clamp(fabPos.y, 4, maxY) };
+  }
+
+  function applyFabPosition() {
+    if (!fabPos) return;
+    fab.style.right = "auto";
+    fab.style.bottom = "auto";
+    fab.style.left = fabPos.x + "px";
+    fab.style.top = fabPos.y + "px";
+  }
+
+  function saveFabPosition() {
+    try {
+      localStorage.setItem(FAB_POS_KEY, JSON.stringify(fabPos));
+    } catch (e) {
+      /* private-browsing / storage disabled — position just won't persist */
+    }
+  }
+
+  function restoreFabPosition() {
+    try {
+      const raw = localStorage.getItem(FAB_POS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (typeof parsed.x === "number" && typeof parsed.y === "number") {
+        fabPos = parsed;
+        clampFabPosition();
+        applyFabPosition();
+      }
+    } catch (e) {
+      /* corrupt/missing stored value — keep default position */
+    }
+  }
+
+  function positionPanel() {
+    const margin = 12;
+    const fabRect = fab.getBoundingClientRect();
+    const panelWidth = panel.offsetWidth || 320;
+    const panelHeight = panel.offsetHeight || 200;
+
+    let left = fabRect.right - panelWidth;
+    left = clamp(left, margin, Math.max(margin, window.innerWidth - panelWidth - margin));
+
+    let top = fabRect.top - panelHeight - 12;
+    if (top < margin) top = fabRect.bottom + 12; // not enough room above — drop it below instead
+    top = clamp(top, margin, Math.max(margin, window.innerHeight - panelHeight - margin));
+
+    panel.style.left = left + "px";
+    panel.style.top = top + "px";
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  }
+
+  function onFabPointerDown(e) {
+    if (e.button !== undefined && e.button !== 0) return; // primary button/touch only
+    const rect = fab.getBoundingClientRect();
+    dragState = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: rect.left,
+      origTop: rect.top,
+      moved: false,
+      pointerId: e.pointerId,
+    };
+  }
+
+  function onFabPointerMove(e) {
+    if (!dragState || dragState.pointerId !== e.pointerId) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    if (!dragState.moved && Math.hypot(dx, dy) < 5) return; // below drag threshold — still a click
+    if (!dragState.moved) {
+      dragState.moved = true;
+      fab.classList.add("fde-dragging");
+      fab.setPointerCapture(dragState.pointerId);
+    }
+    fabPos = { x: dragState.origLeft + dx, y: dragState.origTop + dy };
+    clampFabPosition();
+    applyFabPosition();
+    if (panelOpen) positionPanel();
+  }
+
+  function onFabPointerUp(e) {
+    if (!dragState || dragState.pointerId !== e.pointerId) return;
+    const wasDrag = dragState.moved;
+    fab.classList.remove("fde-dragging");
+    if (fab.hasPointerCapture(dragState.pointerId)) fab.releasePointerCapture(dragState.pointerId);
+    dragState = null;
+    if (wasDrag) {
+      suppressNextClick = true; // the click that follows pointerup shouldn't toggle the panel
+      saveFabPosition();
+    }
+  }
+
+  function onWindowResize() {
+    if (!fabPos) return;
+    clampFabPosition();
+    applyFabPosition();
+    if (panelOpen) positionPanel();
+  }
+
+  function onFullscreenChange() {
+    const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    fab.classList.toggle("fde-hidden", isFullscreen);
+    if (isFullscreen && panelOpen) setPanel(false);
   }
 
   async function translatePage() {
