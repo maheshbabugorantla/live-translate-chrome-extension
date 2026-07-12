@@ -235,6 +235,26 @@ your hit rate is a direct lever on cost. `bench.py` reports:
 > `output_usd_per_mtok` to your provider's current published rates before you
 > trust the dollar figures.
 
+### Optional: shared Redis cache tier
+
+The cache is `memory → Redis (optional) → SQLite → LLM`. Redis is a **no-op on
+a single local process** — memory and SQLite already cover that case. Its real
+win only shows up once you run **more than one replica** of the AI service
+(e.g. multiple Fly.io machines): a translation cached by one instance becomes
+an instant hit for every other instance, instead of each replica having to
+learn the same page from scratch.
+
+It's entirely optional and degrades gracefully — unset or unreachable, the
+service behaves exactly as it does today, just without the shared tier:
+
+```bash
+docker compose up -d redis                                   # local dev only
+echo "REDIS_URL=redis://localhost:6379/0" >> backend/ai-service-python/.env
+```
+
+`GET /health` reports `"redis": "ok" | "down" | "disabled"` so you can see
+which case you're in.
+
 ### Run the benchmark
 
 ```bash

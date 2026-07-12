@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
-from lib.cache import TwoTierCache
+from lib.cache import TwoTierCache, normalize_text
 from lib.constants import MODEL
 from lib.llm import translate_text
 from lib.logger import get_logger
@@ -30,10 +30,11 @@ from lib.logger import get_logger
 load_dotenv()
 
 DB_PATH = os.getenv("TRANSLATION_DB_PATH", "translations.db")
+REDIS_URL = os.getenv("REDIS_URL")  # optional — shared cache tier across replicas
 
 app = FastAPI(title="FDE Live Translate — AI Service")
 log = get_logger("ai-service")
-cache = TwoTierCache(DB_PATH)
+cache = TwoTierCache(DB_PATH, redis_url=REDIS_URL)
 
 
 # request/response shapes ----------------------------------------------------
@@ -50,7 +51,12 @@ class BatchIn(BaseModel):
 @app.on_event("startup")
 async def startup():
     await cache.init()
-    log.info("ai_service_started", extra={"model": MODEL, "db": DB_PATH})
+    log.info("ai_service_started", extra={"model": MODEL, "db": DB_PATH, "redis": cache.redis_status()})
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await cache.close()
 
 
 # --- core: translate one string --------------------------------------------
@@ -93,10 +99,14 @@ async def translate(body: TranslateIn, request: Request):
 
 
 # --- single-flight coalescing for batch cache misses ------------------------
-# Keyed by (target, text): concurrent requests translating the exact same
-# string share one in-flight Future instead of each firing their own LLM call.
-# This also closes a contract gap — "identical (text, target) must never hit
-# the LLM twice" — that broke once /translate/batch went concurrent.
+# Keyed by (target, normalize_text(text)): concurrent requests translating the
+# same text — including casing/whitespace variants of each other — share one
+# in-flight Future instead of each firing their own LLM call. Using the same
+# normalize_text() as the cache key means this layer and the cache agree on
+# what counts as "the same text": a batch of 5 casing variants of one novel
+# phrase now costs exactly 1 LLM call, not up to 5. This also closes a
+# contract gap — "identical (text, target) must never hit the LLM twice" —
+# that broke once /translate/batch went concurrent.
 _inflight: dict[tuple[str, str], "asyncio.Future[tuple[dict, bool]]"] = {}
 
 
@@ -128,7 +138,7 @@ async def _translate_miss(text: str, target: str, semaphore: asyncio.Semaphore, 
 
 
 async def _translate_coalesced(text: str, target: str, semaphore: asyncio.Semaphore, request: Request) -> tuple[dict, bool]:
-    key = (target, text)
+    key = (target, normalize_text(text))
     existing = _inflight.get(key)
     if existing is not None:
         return await existing
@@ -199,7 +209,7 @@ async def translate_batch(body: BatchIn, request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL, "cacheSize": await cache.size()}
+    return {"status": "ok", "model": MODEL, "cacheSize": await cache.size(), "redis": cache.redis_status()}
 
 
 @app.get("/stats")

@@ -1,0 +1,18 @@
+# Local dev convenience only — the AI service works without this. Redis is an
+# optional shared cache tier (see backend/ai-service-python/.env.example);
+# it's a no-op win on a single local process and only pays off across
+# multiple deployed replicas. Start it if you want to exercise that tier:
+#
+#   docker compose up -d redis
+#   echo "REDIS_URL=redis://localhost:6379/0" >> backend/ai-service-python/.env
+#
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
