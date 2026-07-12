@@ -36,14 +36,29 @@ from lib.logger import get_logger
 log = get_logger("llm")
 
 
+@dataclass
+class Completion:
+    """One LLM call's result plus its REAL billable token counts (for cost
+    accounting — see lib/pricing.py). `output_tokens` is deliberately
+    `total_token_count - prompt_token_count`, not just the visible
+    candidate text's token count: Gemini 2.5 models spend internal
+    "thinking" tokens that are billed but not exposed as their own field —
+    they only show up as the gap between total and prompt+candidates.
+    Folding them into output_tokens avoids undercounting real cost."""
+
+    text: str
+    input_tokens: int
+    output_tokens: int
+
+
 class BaseLlmApiClient(ABC):
     """Provider-agnostic interface. One method: give it a system/user prompt
-    and a model id, get back clean text."""
+    and a model id, get back clean text plus real token usage."""
 
     provider: str
 
     @abstractmethod
-    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> str:
+    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> Completion:
         ...
 
     @staticmethod
@@ -65,7 +80,7 @@ class GeminiAPIClient(BaseLlmApiClient):
             raise RuntimeError("GEMINI_API_KEY is not set — cannot construct GeminiAPIClient")
         self._client = genai.Client(api_key=api_key)
 
-    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> str:
+    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> Completion:
         response = await self._client.aio.models.generate_content(
             model=model_id,
             contents=user,
@@ -76,7 +91,15 @@ class GeminiAPIClient(BaseLlmApiClient):
         )
         if not response.text:
             raise RuntimeError(f"Gemini returned an empty response for model {model_id}")
-        return self._clean(response.text)
+
+        usage = response.usage_metadata
+        input_tokens = (usage.prompt_token_count or 0) if usage else 0
+        total_tokens = (usage.total_token_count or 0) if usage else 0
+        # Everything that isn't prompt tokens — visible output plus any
+        # hidden reasoning tokens — billed at the output rate.
+        output_tokens = max(total_tokens - input_tokens, 0)
+
+        return Completion(text=self._clean(response.text), input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 @dataclass
@@ -136,11 +159,14 @@ class LLMRouter:
             raise ValueError("No Gemini models registered in lib.constants.MODELS")
         return cls(routes)
 
-    async def complete(self, *, system: str, user: str) -> tuple[str, str]:
+    async def complete(self, *, system: str, user: str) -> tuple[Completion, str, str]:
+        """Returns (completion, alias, model_id) — model_id (e.g.
+        "gemini-2.5-flash") is what lib.pricing.PricingStore keys on;
+        alias (e.g. "gemini-flash") is what's logged/reported today."""
         route = self.strategy.choose(self.routes)
         log.info("llm_route_selected", extra={"model": route.alias})
-        text = await route.client.complete(system=system, user=user, model_id=route.model_id)
-        return text, route.alias
+        completion = await route.client.complete(system=system, user=user, model_id=route.model_id)
+        return completion, route.alias, route.model_id
 
 
 _router: LLMRouter | None = None
@@ -153,16 +179,42 @@ def _get_router() -> LLMRouter:
     return _router
 
 
-async def translate_text(text: str, target: str = "es-MX", model: str = MODEL) -> str:
-    """Return `text` translated into `target` (Mexican Spanish by default).
+@dataclass
+class TranslationResult:
+    """What translate_text() hands back to app.py — translated text plus
+    everything lib.pricing.PricingStore.cost_usd() needs (model_id, real
+    token counts) to compute actual dollar cost for this call."""
+
+    translated: str
+    model_id: str
+    input_tokens: int
+    output_tokens: int
+
+
+async def translate_text(text: str, target: str = "es-MX", model: str = MODEL) -> TranslationResult:
+    """Return `text` translated into `target` (Mexican Spanish by default),
+    plus the model id and real token counts actually used for this call.
 
     Routing (which Gemini model actually handles the request) is decided by
     LLMRouter, not by the `model` argument — `model` is accepted for API
     compatibility with callers/tests but the router owns model selection.
     """
-    translated, used_alias = await _get_router().complete(
+    completion, used_alias, model_id = await _get_router().complete(
         system=TRANSLATION_SYSTEM_PROMPT,
         user=translation_user_prompt(text),
     )
-    log.info("translate_text", extra={"model": used_alias, "chars": len(text)})
-    return translated
+    log.info(
+        "translate_text",
+        extra={
+            "model": used_alias,
+            "chars": len(text),
+            "inputTokens": completion.input_tokens,
+            "outputTokens": completion.output_tokens,
+        },
+    )
+    return TranslationResult(
+        translated=completion.text,
+        model_id=model_id,
+        input_tokens=completion.input_tokens,
+        output_tokens=completion.output_tokens,
+    )
