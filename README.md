@@ -76,7 +76,7 @@ the edge the browser can reach.
 | Console loader | ✅ Provided | `loader/console-snippet.js` |
 | Chrome extension (MV3) | ✅ Provided | `extension/` |
 | Demo page to test on | ✅ Provided | `demo-pages/index.html` |
-| **Node gateway** | 🔨 **You** — 2 TODOs | `backend/gateway-node/` |
+| **Node gateway** | ✅ DONE | `backend/gateway-node/` |
 | **Python AI service** | 🔨 **You** — the core | `backend/ai-service-python/` |
 
 You should not need to edit the widget. Read it to understand the contract, then
@@ -246,6 +246,24 @@ python benchmark/bench.py --json out.json  # also write machine-readable results
 
 `bench.py` **exits non-zero if any SLA fails**, so it doubles as your grading
 gate and a CI check.
+
+### Accurate cost numbers for this submission
+
+This backend uses **Gemini** (`gemini-2.5-flash`, weighted ~99.96% of traffic,
+with `gemini-2.5-pro` kept at a near-zero weight for future quality-based
+routing — see `backend/ai-service-python/lib/constants.ROUTE_WEIGHTS`), not
+the `claude-sonnet-4-6` placeholder pricing in the provided `benchmark/sla.json`.
+Rather than edit that provided file, the real Gemini pricing (sourced from
+[litellm's model pricing table](https://github.com/BerriAI/litellm/blob/litellm_internal_staging/model_prices_and_context_window.json))
+lives in `benchmark/sla.gemini.json`:
+
+```bash
+python benchmark/bench.py --sla benchmark/sla.gemini.json
+```
+
+The SLA *gate* (latency/hit-rate/throughput/error-rate) is identical between
+the two files and passes either way — only the reported `$`/miss and monthly
+savings differ, since `sla.json`'s cost model only supports one price point.
 
 ---
 

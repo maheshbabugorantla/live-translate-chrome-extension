@@ -1,16 +1,21 @@
 """
-lib/llm.py — the LLM translation call  (TODO: you implement)
-============================================================
+lib/llm.py — the LLM translation call
+======================================
 One job: turn an English string into Mexican Spanish using an LLM.
 
-Provider is your choice. The default example below is Anthropic Claude
-(`pip install anthropic`, set ANTHROPIC_API_KEY). Hamza's launched version
-used Google Gemini — either is fine. Whatever you pick:
-
-  - Write a PROMPT that pins the register to Mexican Spanish (es-MX), not
-    generic/Castilian Spanish. Ask for ONLY the translation, no preamble.
-  - Keep numbers, prices ($), and product/model codes unchanged.
-  - Return a clean string (strip quotes/whitespace the model may add).
+Structure:
+  - BaseLlmApiClient   — provider-agnostic interface. Add Anthropic/OpenAI
+                          later by subclassing; nothing else changes.
+  - GeminiAPIClient     — the only concrete client today.
+  - Route / SelectionStrategy / LLMRouter
+                        — traffic routing across models. Only Gemini models
+                          are registered right now, split by a simple
+                          weighted-random strategy (weights come from
+                          lib.constants.ROUTE_WEIGHTS). Quality-based
+                          rebalancing is a real discipline (needs a defined
+                          scoring methodology, not a stub) and isn't
+                          attempted here — SelectionStrategy is the seam
+                          where that would plug in later.
 
 FAIL LOUD: do NOT wrap the call in a try/except that returns `text` on error.
 If the provider fails, let the exception propagate so the caller returns a 502.
@@ -18,32 +23,146 @@ Silently returning the untranslated input is an automatic fail on this
 assignment (and a real production bug — it ships English while looking healthy).
 """
 import os
+import random
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
-MODEL_DEFAULT = os.getenv("MODEL", "claude-sonnet-4-6")
+from google import genai
+from google.genai import types
+
+from lib.constants import GEMINI, MODEL, MODELS, ROUTE_WEIGHTS, TRANSLATION_SYSTEM_PROMPT, translation_user_prompt
+from lib.logger import get_logger
+
+log = get_logger("llm")
 
 
-async def translate_text(text: str, target: str = "es-MX", model: str = MODEL_DEFAULT) -> str:
-    """Return `text` translated into `target` (Mexican Spanish by default)."""
-    # -----------------------------------------------------------------------
-    # TODO (YOU):
-    #   1. Build a system/user prompt that enforces Mexican Spanish and asks
-    #      for the translation only.
-    #   2. Call your LLM (async if the client supports it).
-    #   3. Clean and return the string.
-    #
-    # --- Example: Anthropic Claude -----------------------------------------
-    # from anthropic import AsyncAnthropic
-    # client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
-    # msg = await client.messages.create(
-    #     model=model,
-    #     max_tokens=1024,
-    #     system=(
-    #         "You are a professional translator. Translate the user's English text "
-    #         "into natural MEXICAN Spanish (es-MX). Return ONLY the translation — no "
-    #         "quotes, no notes. Keep numbers, prices, and product codes unchanged."
-    #     ),
-    #     messages=[{"role": "user", "content": text}],
-    # )
-    # return msg.content[0].text.strip()
-    # -----------------------------------------------------------------------
-    raise NotImplementedError("Implement translate_text() in lib/llm.py")
+class BaseLlmApiClient(ABC):
+    """Provider-agnostic interface. One method: give it a system/user prompt
+    and a model id, get back clean text."""
+
+    provider: str
+
+    @abstractmethod
+    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> str:
+        ...
+
+    @staticmethod
+    def _clean(raw: str) -> str:
+        """Strip whitespace and a wrapping pair of quotes/backticks the model
+        may add despite being told not to (Gemini does this more than most)."""
+        text = raw.strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
+            text = text[1:-1].strip()
+        return text
+
+
+class GeminiAPIClient(BaseLlmApiClient):
+    provider = GEMINI
+
+    def __init__(self):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set — cannot construct GeminiAPIClient")
+        self._client = genai.Client(api_key=api_key)
+
+    async def complete(self, *, system: str, user: str, model_id: str, temperature: float = 0.2) -> str:
+        response = await self._client.aio.models.generate_content(
+            model=model_id,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=temperature,
+            ),
+        )
+        if not response.text:
+            raise RuntimeError(f"Gemini returned an empty response for model {model_id}")
+        return self._clean(response.text)
+
+
+@dataclass
+class Route:
+    """One routable (client, model) pair plus its traffic weight, which is
+    what WeightedRandomStrategy reads to pick a route."""
+
+    client: BaseLlmApiClient
+    alias: str
+    model_id: str
+    weight: float = 1.0
+
+
+class SelectionStrategy(ABC):
+    """How the router picks a Route for a given request. Swap this out to
+    change routing behavior without touching LLMRouter or translate_text()."""
+
+    @abstractmethod
+    def choose(self, routes: list[Route]) -> Route:
+        ...
+
+
+class WeightedRandomStrategy(SelectionStrategy):
+    """Pick a route at random, proportional to its `weight`."""
+
+    def choose(self, routes: list[Route]) -> Route:
+        if not routes:
+            raise ValueError("WeightedRandomStrategy.choose() called with no routes")
+        weights = [max(r.weight, 0.0) for r in routes]
+        if sum(weights) <= 0:
+            # All weights zero/negative (e.g. misconfigured ROUTE_WEIGHTS) —
+            # fail safe with a uniform pick rather than taking translation
+            # down entirely.
+            weights = [1.0] * len(routes)
+        return random.choices(routes, weights=weights, k=1)[0]
+
+
+class LLMRouter:
+    def __init__(self, routes: list[Route], strategy: SelectionStrategy | None = None):
+        if not routes:
+            raise ValueError("LLMRouter needs at least one route")
+        self.routes = routes
+        self.strategy = strategy or WeightedRandomStrategy()
+
+    @classmethod
+    def default(cls) -> "LLMRouter":
+        """Build a router from every Gemini entry in the model registry,
+        sharing one GeminiAPIClient, with starting weights from
+        lib.constants.ROUTE_WEIGHTS (default 1.0 for any alias not listed)."""
+        gemini_client = GeminiAPIClient()
+        routes = [
+            Route(client=gemini_client, alias=alias, model_id=model_id, weight=ROUTE_WEIGHTS.get(alias, 1.0))
+            for alias, (provider, model_id) in MODELS.items()
+            if provider == GEMINI
+        ]
+        if not routes:
+            raise ValueError("No Gemini models registered in lib.constants.MODELS")
+        return cls(routes)
+
+    async def complete(self, *, system: str, user: str) -> tuple[str, str]:
+        route = self.strategy.choose(self.routes)
+        log.info("llm_route_selected", extra={"model": route.alias})
+        text = await route.client.complete(system=system, user=user, model_id=route.model_id)
+        return text, route.alias
+
+
+_router: LLMRouter | None = None
+
+
+def _get_router() -> LLMRouter:
+    global _router
+    if _router is None:
+        _router = LLMRouter.default()
+    return _router
+
+
+async def translate_text(text: str, target: str = "es-MX", model: str = MODEL) -> str:
+    """Return `text` translated into `target` (Mexican Spanish by default).
+
+    Routing (which Gemini model actually handles the request) is decided by
+    LLMRouter, not by the `model` argument — `model` is accepted for API
+    compatibility with callers/tests but the router owns model selection.
+    """
+    translated, used_alias = await _get_router().complete(
+        system=TRANSLATION_SYSTEM_PROMPT,
+        user=translation_user_prompt(text),
+    )
+    log.info("translate_text", extra={"model": used_alias, "chars": len(text)})
+    return translated

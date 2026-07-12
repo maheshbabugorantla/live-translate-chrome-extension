@@ -1,0 +1,25 @@
+{
+  "_comment": "Gemini pricing override for benchmark/sla.json (kept out of the provided file so hygiene checks stay clean). Prices from https://github.com/BerriAI/litellm/blob/litellm_internal_staging/model_prices_and_context_window.json (gemini/gemini-2.5-flash, <=200k context). This service routes ~99.96% of traffic to gemini-flash and ~0.04% to gemini-pro (see backend/ai-service-python/lib/constants.ROUTE_WEIGHTS) — Flash pricing is used here as the representative rate since this cost model only supports one price point, not a per-route blend. Run: python benchmark/bench.py --sla benchmark/sla.gemini.json",
+  "target": "http://localhost:8787",
+
+  "sla": {
+    "cache_hit_p95_ms": 60,
+    "cache_miss_p95_ms": 3500,
+    "min_cache_hit_rate_pct": 60,
+    "max_error_rate_pct": 1.0,
+    "min_throughput_rps": 20
+  },
+
+  "cost_model": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "input_usd_per_mtok": 0.30,
+    "output_usd_per_mtok": 2.50,
+    "monthly_translation_volume": 500000
+  },
+
+  "workload": {
+    "rounds": 4,
+    "concurrency": 8
+  }
+}
