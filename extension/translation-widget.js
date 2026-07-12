@@ -90,6 +90,7 @@
     padding:2px 9px;border-radius:999px;background:#f4f4f5;color:#52525b}
   .fde-badge.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:500}
   .fde-badge.hit{background:#dcfce7;color:#15803d}
+  .fde-badge.spent{background:#dbeafe;color:#1d4ed8}
 
   .fde-row{display:flex;gap:8px}
   .fde-btn{flex:1;display:inline-flex;align-items:center;justify-content:center;
@@ -114,6 +115,7 @@
     .fde-lead{color:#a1a1aa}
     .fde-badge{background:#27272a;color:#a1a1aa}
     .fde-badge.hit{background:rgba(22,163,74,.22);color:#4ade80}
+    .fde-badge.spent{background:rgba(37,99,235,.22);color:#60a5fa}
     .fde-btn{background:#27272a;color:#f4f4f5;border-color:rgba(255,255,255,.12)}
     .fde-btn:hover{background:#323238}
     .fde-btn.primary{background:#fafafa;color:#0b0b0c;border-color:#fafafa}
@@ -195,7 +197,9 @@
     pageBtn.disabled = true;
     badges.innerHTML = "";
     let hits = 0,
-      totalMs = 0;
+      totalMs = 0,
+      totalCostUsd = 0,
+      totalSavingsUsd = 0;
     setStatus(`Translating page… (${nodes.length} text chunks)`);
     try {
       for (let i = 0; i < nodes.length; i += CONFIG.BATCH_SIZE) {
@@ -204,6 +208,8 @@
         const r = await postJSON("/translate/batch", { texts, target: CONFIG.TARGET });
         const results = r.results || [];
         if (typeof r.latencyMs === "number") totalMs += r.latencyMs;
+        if (typeof r.totalCostUsd === "number") totalCostUsd += r.totalCostUsd;
+        if (typeof r.totalSavingsUsd === "number") totalSavingsUsd += r.totalSavingsUsd;
         slice.forEach((n, j) => {
           const res = results[j];
           if (!res) return;
@@ -213,7 +219,7 @@
         });
         setStatus(`Translating page… ${Math.min(i + CONFIG.BATCH_SIZE, nodes.length)}/${nodes.length}`);
       }
-      renderSummary(nodes.length, hits, totalMs);
+      renderSummary(nodes.length, hits, totalMs, totalCostUsd, totalSavingsUsd);
       setStatus(`Page translated. Click "Restore page" to undo.`);
     } catch (err) {
       handleError(err);
@@ -262,11 +268,14 @@
     return nodes;
   }
 
-  function renderSummary(chunks, hits, totalMs) {
+  function renderSummary(chunks, hits, totalMs, totalCostUsd, totalSavingsUsd) {
     badges.innerHTML = "";
     badges.appendChild(badge(chunks + " chunks"));
     badges.appendChild(badge(hits + " cache hit" + (hits === 1 ? "" : "s"), hits ? "hit" : ""));
     if (totalMs) badges.appendChild(badge(Math.round(totalMs) + " ms", "mono"));
+
+    if (totalCostUsd) badges.appendChild(badge("$" + totalCostUsd.toFixed(4) + " spent", "mono spent"));
+    if (totalSavingsUsd) badges.appendChild(badge("$" + totalSavingsUsd.toFixed(4) + " saved", "mono hit"));
   }
   function badge(text, kind) {
     return el("span", "fde-badge" + (kind ? " " + kind : ""), text);
